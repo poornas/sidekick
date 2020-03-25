@@ -59,8 +59,11 @@ var (
 	timeZero             = time.Time{}
 )
 
+type prometheusAuthType string
+
 const (
-	prometheusMetricsPath = "/.prometheus/metrics"
+	prometheusMetricsPath                    = "/.prometheus/metrics"
+	prometheusPublic      prometheusAuthType = "public"
 )
 
 func log(msg logMessage) error {
@@ -131,6 +134,7 @@ type Backend struct {
 	healthCheckDuration int
 	Stats               *BackendStats
 	DowntimeStart       time.Time
+	cacheClient         *S3CacheClient
 }
 
 // BackendStatus - if true, backend is up.
@@ -373,7 +377,17 @@ func (lb *loadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	handlerFn := func(w http.ResponseWriter, r *http.Request) {
 		proxy.ServeHTTP(w, r)
 	}
-	httpTraceHdrs(handlerFn, w, r, lb.backends[bkIdx])
+
+	cacheHandlerFn := func(w http.ResponseWriter, r *http.Request) {
+		if lb.backends[bkIdx].cacheClient != nil {
+			cacheHandler(handlerFn, w, r, lb.backends[bkIdx])(w, r)
+		} else {
+			handlerFn(w, r)
+		}
+	}
+
+	httpTraceHdrs(cacheHandlerFn, w, r, lb.backends[bkIdx])
+
 }
 
 // mustGetSystemCertPool - return system CAs or empty pool in case of error (or windows)
@@ -454,6 +468,13 @@ func clientTransport(ctx *cli.Context, enableTLS bool) http.RoundTripper {
 	return tr
 }
 
+// // S3Cache entity to which requests gets cached.
+// type S3Cache struct {
+// 	endpoint   string
+// 	proxy      *httputil.ReverseProxy
+// 	httpClient *http.Client
+// }
+
 func checkMain(ctx *cli.Context) {
 	if !ctx.Args().Present() {
 		console.Fatalln(fmt.Errorf("not arguments found, please check documentation '%s --help'", ctx.App.Name))
@@ -510,6 +531,7 @@ func sidekickMain(ctx *cli.Context) {
 		endpoints = ctx.Args()
 	}
 
+	cacheCfg := newCacheConfig()
 	var backends []*Backend
 	for _, endpoint := range endpoints {
 		endpoint = strings.TrimSuffix(endpoint, slashSeparator)
@@ -533,7 +555,7 @@ func sidekickMain(ctx *cli.Context) {
 		stats := BackendStats{MinLatency: time.Duration(24 * time.Hour), MaxLatency: time.Duration(0)}
 		backend := &Backend{endpoint, proxy, &http.Client{
 			Transport: proxy.Transport,
-		}, false, healthCheckPath, healthCheckDuration, &stats, timeZero}
+		}, false, healthCheckPath, healthCheckDuration, &stats, timeZero, newCacheClient(ctx, cacheCfg)}
 		go backend.healthCheck()
 		proxy.ErrorHandler = backend.ErrorHandler
 		backends = append(backends, backend)
@@ -573,6 +595,7 @@ func sidekickMain(ctx *cli.Context) {
 	} else {
 		console.Infoln("Listening on", addr)
 	}
+
 	router := mux.NewRouter().SkipClean(true).UseEncodedPath()
 	registerMetricsRouter(router)
 	router.PathPrefix("/").Handler(&loadBalancer{
